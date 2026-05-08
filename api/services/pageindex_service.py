@@ -1,0 +1,176 @@
+import asyncio
+import json
+import os
+
+from pageindex.page_index import (
+    add_preface_if_needed,
+    check_title_appearance_in_start_concurrent,
+    meta_processor,
+    process_large_node_recursively,
+)
+from pageindex.utils import (
+    ConfigLoader,
+    JsonLogger,
+    add_node_text,
+    count_tokens,
+    create_clean_structure_for_description,
+    format_structure,
+    generate_doc_description,
+    generate_summaries_for_structure,
+    post_processing,
+    remove_structure_text,
+    write_node_id,
+)
+
+
+# ── S3 helpers ────────────────────────────────────────────────────────────────
+
+def read_markdown_from_s3(key: str, s3_client, bucket: str) -> str:
+    return s3_client.get_object(Bucket=bucket, Key=key)["Body"].read().decode("utf-8")
+
+
+def upload_tree_to_s3(key: str, data: dict, s3_client, bucket: str) -> None:
+    s3_client.put_object(
+        Bucket=bucket,
+        Key=key,
+        Body=json.dumps(data, indent=2, ensure_ascii=False),
+        ContentType="application/json",
+    )
+
+
+# ── Markdown → page_list ──────────────────────────────────────────────────────
+
+def markdown_to_page_list(content: str, tokens_per_page: int, model: str) -> list[tuple[str, int]]:
+    """Split markdown text into virtual pages for the pipeline.
+
+    Accumulates lines until the chunk reaches tokens_per_page, then flushes.
+    Each virtual page maps 1-to-1 with a physical_index in the output tree.
+    """
+    lines = content.split("\n")
+    pages: list[tuple[str, int]] = []
+    current_lines: list[str] = []
+    current_tokens = 0
+
+    for line in lines:
+        line_tokens = count_tokens(line, model) if line.strip() else 1
+        if current_tokens + line_tokens > tokens_per_page and current_lines:
+            chunk = "\n".join(current_lines)
+            pages.append((chunk, count_tokens(chunk, model)))
+            current_lines = []
+            current_tokens = 0
+        current_lines.append(line)
+        current_tokens += line_tokens
+
+    if current_lines:
+        chunk = "\n".join(current_lines)
+        pages.append((chunk, count_tokens(chunk, model)))
+
+    return pages
+
+
+# ── Pipeline (sync wrapper so it can be offloaded via asyncio.to_thread) ──────
+
+def _build_tree(page_list: list[tuple[str, int]], opt) -> tuple[list, str]:
+    """Run the full PDF pipeline on virtual markdown pages.
+
+    Calls meta_processor(mode='process_no_toc') directly — skipping check_toc()
+    — then follows the same post-processing steps as page_index_main():
+    preface, boundary detection, tree build, large-node recursion, optional
+    summaries/description. Wrapped in asyncio.run() so it can be called from
+    asyncio.to_thread() without touching the server's event loop.
+    """
+    logger = JsonLogger("markdown_api")
+    logger.log({"total_page_number": len(page_list)})
+    logger.log({"total_token": sum(t for _, t in page_list)})
+
+    async def _run():
+        # Directly enter process_no_toc — no TOC scanning for markdown
+        flat_toc = await meta_processor(
+            page_list, mode="process_no_toc", start_index=1, opt=opt, logger=logger
+        )
+
+        flat_toc = add_preface_if_needed(flat_toc)
+        flat_toc = await check_title_appearance_in_start_concurrent(
+            flat_toc, page_list, model=opt.model, logger=logger
+        )
+        valid_items = [item for item in flat_toc if item.get("physical_index") is not None]
+
+        tree = post_processing(valid_items, len(page_list))
+        await asyncio.gather(
+            *[process_large_node_recursively(node, page_list, opt, logger=logger) for node in tree]
+        )
+
+        if opt.if_add_node_id == "yes":
+            write_node_id(tree)
+        if opt.if_add_node_text == "yes" or opt.if_add_node_summary == "yes":
+            add_node_text(tree, page_list)
+        description = ""
+        if opt.if_add_node_summary == "yes":
+            await generate_summaries_for_structure(tree, model=opt.model)
+            if opt.if_add_node_text == "no":
+                remove_structure_text(tree)
+            # Matches original page_index_builder(): description is only generated
+            # when summaries are also enabled (nested inside the summary block).
+            if opt.if_add_doc_description == "yes":
+                clean = create_clean_structure_for_description(tree)
+                description = generate_doc_description(clean, model=opt.model)
+
+        tree = format_structure(
+            tree,
+            order=["title", "node_id", "start_index", "end_index", "summary", "text", "nodes"],
+        )
+        return tree, description
+
+    return asyncio.run(_run())
+
+
+# ── Public orchestrator ───────────────────────────────────────────────────────
+
+def _build_config_overrides(payload) -> dict:
+    """Build config overrides with three-tier priority.
+
+    Priority (highest → lowest):
+      1. Request fields — explicit per-call values
+      2. PAGEINDEX_* env vars — deploy-time defaults
+      3. pageindex/config.yaml — library defaults (handled by ConfigLoader)
+    """
+    _ENV_MAP = {
+        "model": "PAGEINDEX_MODEL",
+        "if_add_node_id": "PAGEINDEX_IF_ADD_NODE_ID",
+        "if_add_node_summary": "PAGEINDEX_IF_ADD_NODE_SUMMARY",
+        "if_add_node_text": "PAGEINDEX_IF_ADD_NODE_TEXT",
+        "if_add_doc_description": "PAGEINDEX_IF_ADD_DOC_DESCRIPTION",
+    }
+    # Start with env vars as base layer
+    overrides = {key: os.environ[env] for key, env in _ENV_MAP.items() if env in os.environ}
+
+    # Overlay request fields (non-None values take precedence over env vars)
+    request_fields = {
+        "model": payload.model,
+        "if_add_node_id": payload.if_add_node_id,
+        "if_add_node_summary": payload.if_add_node_summary,
+        "if_add_node_text": payload.if_add_node_text,
+        "if_add_doc_description": payload.if_add_doc_description,
+        **(payload.extra_config or {}),
+    }
+    overrides.update({k: v for k, v in request_fields.items() if v is not None})
+
+    return overrides
+
+
+async def process_markdown(payload, s3_client, bucket: str) -> dict:
+    content = await asyncio.to_thread(read_markdown_from_s3, payload.input_s3_key, s3_client, bucket)
+
+    opt = ConfigLoader().load(_build_config_overrides(payload))
+    page_list = markdown_to_page_list(content, payload.tokens_per_page, opt.model)
+
+    tree, description = await asyncio.to_thread(_build_tree, page_list, opt)
+
+    output = {
+        "doc_name": payload.doc_name,
+        "doc_description": description,
+        "structure": tree,
+    }
+    await asyncio.to_thread(upload_tree_to_s3, payload.output_s3_key, output, s3_client, bucket)
+
+    return {**output, "output_s3_key": payload.output_s3_key}
