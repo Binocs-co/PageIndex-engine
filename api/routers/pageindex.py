@@ -17,7 +17,6 @@ _CONFIG_YAML_NOTE = "Defaults to the value in pageindex/config.yaml when not pro
 class MarkdownPageIndexRequest(BaseModel):
     input_s3_key: str = Field(..., description="S3 key of the markdown file to index.")
     output_s3_key: str = Field(..., description="S3 key where the output tree JSON will be written.")
-    doc_name: str = Field(default="document", description="Human-readable document name.")
     tokens_per_page: int = Field(
         default=2000,
         ge=500,
@@ -40,7 +39,6 @@ class MarkdownPageIndexRequest(BaseModel):
 
 
 class MarkdownPageIndexResponse(BaseModel):
-    doc_name: str
     output_s3_key: str
     doc_description: str
     structure: list
@@ -56,6 +54,6 @@ async def index_markdown(payload: MarkdownPageIndexRequest) -> MarkdownPageIndex
     try:
         result = await process_markdown(payload, get_s3_client(), get_s3_bucket())
     except Exception as e:
-        logger.error(f"PageIndex pipeline failed for '{payload.doc_name}': {e}", exc_info=True)
+        logger.error(f"PageIndex pipeline failed for '{payload.input_s3_key}': {e}", exc_info=True)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
     return result

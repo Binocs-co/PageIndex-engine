@@ -1,6 +1,9 @@
 import asyncio
 import json
 import os
+import re
+
+_PAGE_TAG_RE = re.compile(r"(<page_number=\d+>.*?</page_number_\d+>)", re.DOTALL)
 
 from pageindex.page_index import (
     add_preface_if_needed,
@@ -43,9 +46,17 @@ def upload_tree_to_s3(key: str, data: dict, s3_client, bucket: str) -> None:
 def markdown_to_page_list(content: str, tokens_per_page: int, model: str) -> list[tuple[str, int]]:
     """Split markdown text into virtual pages for the pipeline.
 
-    Accumulates lines until the chunk reaches tokens_per_page, then flushes.
-    Each virtual page maps 1-to-1 with a physical_index in the output tree.
+    When the content contains <page_number=N>...</page_number_N> tags (produced
+    by the OCR-to-markdown converter), each tag block becomes exactly one virtual
+    page. This keeps physical_index values accurate to real document page numbers.
+
+    Falls back to token-budget chunking for plain markdown without page tags.
+    tokens_per_page is unused in the tagged path.
     """
+    tag_matches = _PAGE_TAG_RE.findall(content)
+    if tag_matches:
+        return [(page, count_tokens(page, model)) for page in tag_matches if page.strip()]
+
     lines = content.split("\n")
     pages: list[tuple[str, int]] = []
     current_lines: list[str] = []
@@ -80,8 +91,8 @@ def _build_tree(page_list: list[tuple[str, int]], opt) -> tuple[list, str]:
     asyncio.to_thread() without touching the server's event loop.
     """
     logger = JsonLogger("markdown_api")
-    logger.log({"total_page_number": len(page_list)})
-    logger.log({"total_token": sum(t for _, t in page_list)})
+    logger.info({"total_page_number": len(page_list)})
+    logger.info({"total_token": sum(t for _, t in page_list)})
 
     async def _run():
         # Directly enter process_no_toc — no TOC scanning for markdown
@@ -167,7 +178,6 @@ async def process_markdown(payload, s3_client, bucket: str) -> dict:
     tree, description = await asyncio.to_thread(_build_tree, page_list, opt)
 
     output = {
-        "doc_name": payload.doc_name,
         "doc_description": description,
         "structure": tree,
     }
