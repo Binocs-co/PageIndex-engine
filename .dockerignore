@@ -1,0 +1,9 @@
+env/
+logs/
+.env
+.git
+__pycache__
+*.pyc
+*.pyo
+cookbook/
+examples/
