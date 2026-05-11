@@ -3,7 +3,7 @@ import logging
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, Field
 
-from api.dependencies import get_s3_bucket, get_s3_client
+from api.dependencies import get_s3_bucket, get_s3_session
 from api.services.pageindex_service import process_markdown
 
 logger = logging.getLogger(__name__)
@@ -52,7 +52,7 @@ async def index_markdown(payload: MarkdownPageIndexRequest) -> MarkdownPageIndex
     + verification + retry logic, then writes the resulting tree JSON back to S3.
     """
     try:
-        result = await process_markdown(payload, get_s3_client(), get_s3_bucket())
+        result = await process_markdown(payload, get_s3_session(), get_s3_bucket())
     except Exception as e:
         logger.error(f"PageIndex pipeline failed for '{payload.input_s3_key}': {e}", exc_info=True)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))

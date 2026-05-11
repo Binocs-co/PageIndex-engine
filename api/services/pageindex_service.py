@@ -3,7 +3,7 @@ import json
 import os
 import re
 
-_PAGE_TAG_RE = re.compile(r"(<page_number=\d+>.*?</page_number_\d+>)", re.DOTALL)
+_PAGE_TAG_RE = re.compile(r"(<page_number=\d+>.*?</page_number=\d+>)", re.DOTALL)
 
 from pageindex.page_index import (
     add_preface_if_needed,
@@ -28,17 +28,20 @@ from pageindex.utils import (
 
 # ── S3 helpers ────────────────────────────────────────────────────────────────
 
-def read_markdown_from_s3(key: str, s3_client, bucket: str) -> str:
-    return s3_client.get_object(Bucket=bucket, Key=key)["Body"].read().decode("utf-8")
+async def read_markdown_from_s3(key: str, s3_session, bucket: str) -> str:
+    async with s3_session.client("s3") as s3:
+        resp = await s3.get_object(Bucket=bucket, Key=key)
+        return (await resp["Body"].read()).decode("utf-8")
 
 
-def upload_tree_to_s3(key: str, data: dict, s3_client, bucket: str) -> None:
-    s3_client.put_object(
-        Bucket=bucket,
-        Key=key,
-        Body=json.dumps(data, indent=2, ensure_ascii=False),
-        ContentType="application/json",
-    )
+async def upload_tree_to_s3(key: str, data: dict, s3_session, bucket: str) -> None:
+    async with s3_session.client("s3") as s3:
+        await s3.put_object(
+            Bucket=bucket,
+            Key=key,
+            Body=json.dumps(data, indent=2, ensure_ascii=False),
+            ContentType="application/json",
+        )
 
 
 # ── Markdown → page_list ──────────────────────────────────────────────────────
@@ -46,7 +49,7 @@ def upload_tree_to_s3(key: str, data: dict, s3_client, bucket: str) -> None:
 def markdown_to_page_list(content: str, tokens_per_page: int, model: str) -> list[tuple[str, int]]:
     """Split markdown text into virtual pages for the pipeline.
 
-    When the content contains <page_number=N>...</page_number_N> tags (produced
+    When the content contains <page_number=N>...</page_number=N> tags (produced
     by the OCR-to-markdown converter), each tag block becomes exactly one virtual
     page. This keeps physical_index values accurate to real document page numbers.
 
@@ -169,8 +172,8 @@ def _build_config_overrides(payload) -> dict:
     return overrides
 
 
-async def process_markdown(payload, s3_client, bucket: str) -> dict:
-    content = await asyncio.to_thread(read_markdown_from_s3, payload.input_s3_key, s3_client, bucket)
+async def process_markdown(payload, s3_session, bucket: str) -> dict:
+    content = await read_markdown_from_s3(payload.input_s3_key, s3_session, bucket)
 
     opt = ConfigLoader().load(_build_config_overrides(payload))
     page_list = markdown_to_page_list(content, payload.tokens_per_page, opt.model)
@@ -181,6 +184,6 @@ async def process_markdown(payload, s3_client, bucket: str) -> dict:
         "doc_description": description,
         "structure": tree,
     }
-    await asyncio.to_thread(upload_tree_to_s3, payload.output_s3_key, output, s3_client, bucket)
+    await upload_tree_to_s3(payload.output_s3_key, output, s3_session, bucket)
 
     return {**output, "output_s3_key": payload.output_s3_key}
