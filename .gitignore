@@ -4,3 +4,14 @@ __pycache__
 .env*
 .venv/
 logs/
+.idea/
+.claude/
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
