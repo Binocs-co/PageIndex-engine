@@ -6,12 +6,7 @@ import re
 
 _PAGE_TAG_RE = re.compile(r"(<page_number=\d+>.*?</page_number=\d+>)", re.DOTALL)
 
-from pageindex.page_index import (
-    add_preface_if_needed,
-    check_title_appearance_in_start_concurrent,
-    meta_processor,
-    process_large_node_recursively,
-)
+from pageindex.page_index import process_large_node_recursively
 from pageindex.utils import (
     ConfigLoader,
     add_node_text,
@@ -19,11 +14,10 @@ from pageindex.utils import (
     count_tokens,
     create_clean_structure_for_description,
     format_structure,
-    generate_summaries_for_structure,
-    post_processing,
     remove_structure_text,
     write_node_id,
 )
+from pageindex_fallback import FallbackState, FallbackTreeBuilder
 
 logger = logging.getLogger(__name__)
 # ── S3 helpers ────────────────────────────────────────────────────────────────
@@ -82,23 +76,25 @@ def markdown_to_page_list(content: str, tokens_per_page: int, model: str) -> lis
     return pages
 
 
-# ── Tree building: attempt and retry ──────────────────────────────────────────
+# ── Tree building: attempt, retry, fallback ───────────────────────────────────
 
 class MarkdownIndexer:
     """Indexes one markdown document: config, retry, tree, summaries.
 
         indexer = MarkdownIndexer(payload)
-        tree, description, attempts = await indexer.build_tree(page_list)
+        tree, description, fallback, attempts = await indexer.build_tree(page_list)
 
-    A *raised* extraction failure (a truncated completion, or an unparseable one, which
-    makes extract_json return {} and the following extend() raise AttributeError) is
-    retried up to `max_attempts` times. If every attempt raises, the last exception
-    propagates and the router turns it into a 500 — the same outcome as before, reached
-    after N attempts instead of one.
+    Two independent recoveries, and the difference matters:
 
-    A TOC that merely *fails verification* is not retried. The library already repairs
-    what it can inside meta_processor(), and at temperature 0 a re-run reproduces the
-    same extraction, so a second attempt would only cost tokens.
+    * A TOC that fails verification is handled by FallbackTreeBuilder: it repairs what it
+      can and, if any item is still misplaced, returns the page-level tree and reports it
+      through the FallbackState it hands back. Nothing is retried — at temperature 0 a
+      re-run reproduces the same extraction.
+    * A *raised* extraction failure (a truncated completion, or an unparseable one, which
+      makes extract_json return {} and the following extend() raise AttributeError) is
+      retried up to `max_attempts` times. If every attempt raises, the page-level index is
+      built here instead — unconditionally, so a failure that would otherwise reach the
+      router and become a 500 returns a usable tree.
 
     Only extraction and tree assembly are retried. Node text, summaries and the
     description run once, on whichever tree survives, so a retry never pays for summaries
@@ -121,6 +117,10 @@ class MarkdownIndexer:
         self.payload = payload
         self.opt = ConfigLoader().load(self.config_overrides())
         self.max_attempts = self.resolve_max_tree_attempts()
+        # No doc_name on this path — name the root after the input file.
+        self.doc_title = (
+            os.path.splitext(os.path.basename(payload.input_s3_key))[0] or "Document"
+        )
 
     # ── configuration ────────────────────────────────────────────────────────
 
@@ -173,62 +173,49 @@ class MarkdownIndexer:
     def page_list(self, content: str) -> list[tuple[str, int]]:
         return markdown_to_page_list(content, self.payload.tokens_per_page, self.opt.model)
 
-    async def build_tree(self, page_list: list[tuple[str, int]]) -> tuple[list, str, int]:
-        """Returns (tree, doc_description, attempts)."""
+    async def build_tree(
+        self, page_list: list[tuple[str, int]]
+    ) -> tuple[list, str, FallbackState, int]:
+        """Returns (tree, doc_description, fallback, attempts)."""
         logger.info({"total_page_number": len(page_list)})
         logger.info({"total_token": sum(t for _, t in page_list)})
 
-        tree, attempts = await self._extract_with_retries(page_list)
+        # One builder for the whole document: it both extracts the tree and summarizes
+        # whichever tree came out, so it is created here rather than inside the retry loop.
+        builder = FallbackTreeBuilder(page_list, self.opt, logger, doc_title=self.doc_title)
+        tree, fallback, attempts = await self._extract_with_retries(builder)
 
-        await self._split_large_nodes(tree, page_list)
+        if not fallback.used:
+            await self._split_large_nodes(tree, page_list)
 
         if self.opt.if_add_node_id == "yes":
             write_node_id(tree)
         if self.opt.if_add_node_text == "yes" or self.opt.if_add_node_summary == "yes":
             add_node_text(tree, page_list)
 
-        description = await self._add_summaries(tree)
+        description = await self._add_summaries(builder, tree, fallback)
 
         tree = format_structure(
             tree,
             order=["title", "node_id", "start_index", "end_index", "summary", "text", "nodes"],
         )
-        return tree, description, attempts
+        return tree, description, fallback, attempts
 
-    async def _extract(self, page_list):
-        """One extraction attempt: the tree the pipeline builds for these pages.
+    async def _extract_with_retries(self, builder):
+        """Retry a *raised* extraction, then fall back. Returns (tree, fallback, attempts).
 
-        Enters meta_processor(mode='process_no_toc') directly — no TOC scanning for
-        markdown — then follows the same post-processing steps as page_index_main():
-        preface, boundary detection, tree build.
-        """
-        flat_toc = await meta_processor(
-            page_list, mode="process_no_toc", start_index=1, opt=self.opt, logger=logger
-        )
-
-        flat_toc = add_preface_if_needed(flat_toc)
-        flat_toc = await check_title_appearance_in_start_concurrent(
-            flat_toc, page_list, model=self.opt.model, logger=logger
-        )
-        valid_items = [item for item in flat_toc if item.get("physical_index") is not None]
-
-        return post_processing(valid_items, len(page_list))
-
-    async def _extract_with_retries(self, page_list):
-        """Retry a *raised* extraction. Returns (tree, attempts); re-raises if all fail.
-
-        max_attempts is clamped to at least 1, so the loop always either returns a tree or
-        raises — it never falls through.
+        max_attempts is clamped to at least 1, so the loop always returns — either a tree
+        an attempt produced, or the page-level index.
         """
         for attempt in range(1, self.max_attempts + 1):
             try:
-                tree = await self._extract(page_list)
+                tree, fallback = await builder.build()
                 if attempt > 1:
                     logger.info(
                         "tree extraction succeeded on attempt %d/%d",
                         attempt, self.max_attempts,
                     )
-                return tree, attempt
+                return tree, fallback, attempt
             except Exception as exc:
                 # No backoff: llm_acompletion already retried the provider 10x with a 1s
                 # sleep, so what reaches here is a post-transport failure a pause cannot
@@ -238,11 +225,17 @@ class MarkdownIndexer:
                     attempt, self.max_attempts, exc, exc_info=True,
                 )
                 if attempt == self.max_attempts:
-                    logger.error(
-                        "all %d tree extraction attempts failed, giving up (last error: %s)",
-                        self.max_attempts, exc,
+                    # The page-level index is unconditional: an exhausted retry budget
+                    # always yields a tree, never a 500. No verification ever ran, so
+                    # there is no accuracy to report — accuracy=None is what tells this
+                    # apart from a failed verification.
+                    logger.warning(
+                        "all %d tree extraction attempts failed (last error: %s) — "
+                        "building the page-level index for %d pages instead",
+                        self.max_attempts, exc, builder.page_count,
                     )
-                    raise
+                    tree = builder.page_level_index().tree()
+                    return tree, FallbackState(used=True, accuracy=None), self.max_attempts
 
     async def _split_large_nodes(self, tree, page_list):
         """Kept out of the retry scope on purpose: this re-enters the library's
@@ -262,7 +255,7 @@ class MarkdownIndexer:
                 failure, exc_info=failure,
             )
 
-    async def _add_summaries(self, tree) -> str:
+    async def _add_summaries(self, builder, tree, fallback) -> str:
         """Summaries and, nested inside them, the document description.
 
         The nesting matches the library's page_index_builder(): a description is only
@@ -271,7 +264,9 @@ class MarkdownIndexer:
         if self.opt.if_add_node_summary != "yes":
             return ""
 
-        await generate_summaries_for_structure(tree, model=self.opt.model)
+        # A page-level root spans the whole document, so it is summarized from its page
+        # summaries rather than from its own text; the builder picks the strategy.
+        await builder.summarize(tree, fallback_used=fallback.used)
         if self.opt.if_add_node_text == "no":
             remove_structure_text(tree)
 
@@ -288,11 +283,17 @@ async def process_markdown(payload, s3_session, bucket: str) -> dict:
     indexer = MarkdownIndexer(payload)
     content = await read_markdown_from_s3(payload.input_s3_key, s3_session, bucket)
 
-    tree, description, attempts = await indexer.build_tree(indexer.page_list(content))
+    tree, description, fallback, attempts = await indexer.build_tree(
+        indexer.page_list(content)
+    )
 
     output = {
         "doc_description": description,
         "structure": tree,
+        "fallback_used": fallback.used,
+        # None when the fallback came from a failed extraction rather than a failed
+        # verification.
+        "fallback_accuracy": fallback.accuracy,
         # Persisted too, so a stored tree can be triaged after the fact.
         "attempts": attempts,
     }
