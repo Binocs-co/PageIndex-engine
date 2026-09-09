@@ -30,6 +30,17 @@ class MarkdownPageIndexRequest(BaseModel):
     if_add_node_summary: str | None = Field(default=None, description=f'"yes" or "no". {_CONFIG_YAML_NOTE}')
     if_add_node_text: str | None = Field(default=None, description=f'"yes" or "no". {_CONFIG_YAML_NOTE}')
     if_add_doc_description: str | None = Field(default=None, description=f'"yes" or "no". {_CONFIG_YAML_NOTE}')
+    max_tree_attempts: int | None = Field(
+        default=None,
+        ge=1,
+        le=3,
+        description=(
+            "How many times to attempt tree extraction before the request fails. Only "
+            "*raised* failures are retried (a truncated or unparseable LLM completion); a "
+            "low-accuracy result is not, since the extraction is deterministic at "
+            "temperature 0. Defaults to PAGEINDEX_MAX_TREE_ATTEMPTS, else 2."
+        ),
+    )
 
     extra_config: dict | None = Field(
         default=None,
@@ -42,6 +53,13 @@ class MarkdownPageIndexResponse(BaseModel):
     output_s3_key: str
     doc_description: str
     structure: list
+    attempts: int = Field(
+        default=1,
+        description=(
+            "How many tree extraction attempts were made. Greater than 1 means an attempt "
+            "raised and was retried; see the server logs for the failure."
+        ),
+    )
 
 
 @pageindex_router.post("/markdown", response_model=MarkdownPageIndexResponse)
