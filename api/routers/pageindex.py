@@ -35,10 +35,10 @@ class MarkdownPageIndexRequest(BaseModel):
         ge=1,
         le=3,
         description=(
-            "How many times to attempt tree extraction before the request fails. Only "
-            "*raised* failures are retried (a truncated or unparseable LLM completion); a "
-            "low-accuracy result is not, since the extraction is deterministic at "
-            "temperature 0. Defaults to PAGEINDEX_MAX_TREE_ATTEMPTS, else 2."
+            "How many times to attempt tree extraction before giving up and returning the "
+            "page-level index. Only *raised* failures are retried (a truncated or "
+            "unparseable LLM completion); a low-accuracy result is not, since the "
+            "extraction is deterministic. Defaults to PAGEINDEX_MAX_TREE_ATTEMPTS, else 2."
         ),
     )
 
@@ -53,6 +53,14 @@ class MarkdownPageIndexResponse(BaseModel):
     output_s3_key: str
     doc_description: str
     structure: list
+    fallback_used: bool = Field(
+        default=False,
+        description=(
+            "True when structure detection failed verification and the returned tree is a "
+            "deterministic one-node-per-page index (root + one leaf per page). The fallback "
+            "is unconditional — there is no way to ask for a failure instead."
+        ),
+    )
     attempts: int = Field(
         default=1,
         description=(
